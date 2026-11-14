@@ -2,8 +2,8 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:video_player/video_player.dart';
-import 'package:ffmpeg_kit_flutter_min/ffmpeg_kit.dart';
-import 'package:ffmpeg_kit_flutter_min/return_code.dart';
+import 'package:ffmpeg_kit_flutter_new_min/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new_min/return_code.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:gal/gal.dart';
 
@@ -248,8 +248,6 @@ class _CutterHomePageState extends State<CutterHomePage> {
                     ),
                   ),
                   const SizedBox(height: 8),
-
-                  // လက်ရှိအချိန် နှင့် Play/Pause + Fine Tune ခလုတ်များ
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                     children: [
@@ -273,7 +271,6 @@ class _CutterHomePageState extends State<CutterHomePage> {
                       TextButton(onPressed: () => _seekRelative(1.0), child: const Text('+1s')),
                     ],
                   ),
-
                   Center(
                     child: Text(
                       'လက်ရှိနေရာ: ${_formatSec(currentPos)} / ${_formatSec(maxDur)}',
@@ -281,8 +278,6 @@ class _CutterHomePageState extends State<CutterHomePage> {
                     ),
                   ),
                   const SizedBox(height: 12),
-
-                  // Start / End သတ်မှတ်သည့် ခလုတ်များ
                   Row(
                     children: [
                       Expanded(
@@ -310,8 +305,6 @@ class _CutterHomePageState extends State<CutterHomePage> {
                     ],
                   ),
                   const Divider(height: 24),
-
-                  // ဖြတ်မည့် Clip စာရင်း
                   const Text(
                     'ဖြတ်ထုတ်မည့် အပိုင်းများ (Clips Queue):',
                     style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
@@ -344,10 +337,7 @@ class _CutterHomePageState extends State<CutterHomePage> {
                         ),
                       );
                     }),
-
                   const SizedBox(height: 12),
-
-                  // Export ခလုတ် ၂ ခု
                   if (_clips.isNotEmpty)
                     Row(
                       children: [
@@ -378,7 +368,6 @@ class _CutterHomePageState extends State<CutterHomePage> {
                         ),
                       ],
                     ),
-
                   if (_statusMessage.isNotEmpty) ...[
                     const SizedBox(height: 16),
                     Container(
