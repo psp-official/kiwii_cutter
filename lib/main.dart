@@ -8,72 +8,130 @@ import 'package:path_provider/path_provider.dart';
 import 'package:gal/gal.dart';
 
 void main() {
-  runApp(const LosslessCutterApp());
+  runApp(const CapCutLosslessApp());
 }
 
-class LosslessCutterApp extends StatelessWidget {
-  const LosslessCutterApp({super.key});
+class CapCutLosslessApp extends StatelessWidget {
+  const CapCutLosslessApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Lossless Video Cutter',
+      title: 'CapCut Lossless Cutter',
       debugShowCheckedModeBanner: false,
       theme: ThemeData.dark().copyWith(
-        scaffoldBackgroundColor: const Color(0xFF121212),
+        scaffoldBackgroundColor: const Color(0xFF0E0E0E),
         colorScheme: const ColorScheme.dark(
-          primary: Color(0xFF00E676),
-          secondary: Color(0xFF2979FF),
+          primary: Color(0xFF00E5FF),
+          secondary: Colors.white,
         ),
       ),
-      home: const CutterHomePage(),
+      home: const CapCutEditorPage(),
     );
   }
 }
 
 class VideoSegment {
-  double start;
-  double end;
-  bool isDeleted;
+  final double start;
+  final double end;
 
-  VideoSegment({
-    required this.start,
-    required this.end,
-    this.isDeleted = false,
-  });
+  VideoSegment({required this.start, required this.end});
+
+  double get duration => end - start;
+
+  VideoSegment copy() => VideoSegment(start: start, end: end);
 }
 
-class CutterHomePage extends StatefulWidget {
-  const CutterHomePage({super.key});
+class EditorSnapshot {
+  final List<VideoSegment> segments;
+  final int selectedIndex;
+
+  EditorSnapshot({required this.segments, required this.selectedIndex});
+}
+
+class CapCutEditorPage extends StatefulWidget {
+  const CapCutEditorPage({super.key});
 
   @override
-  State<CutterHomePage> createState() => _CutterHomePageState();
+  State<CapCutEditorPage> createState() => _CapCutEditorPageState();
 }
 
-class _CutterHomePageState extends State<CutterHomePage> {
+class _CapCutEditorPageState extends State<CapCutEditorPage> {
   VideoPlayerController? _controller;
   final ScrollController _timelineScrollController = ScrollController();
 
   String? _videoPath;
   bool _isProcessing = false;
   bool _isUserScrolling = false;
+  bool _isMuted = false;
   String _statusMessage = '';
-  double _zoomLevel = 1.0;
 
   final List<String?> _thumbnails = [];
-  final List<VideoSegment> _segments = [];
-  int _selectedSegmentIndex = 0;
+  List<VideoSegment> _segments = [];
+  int _selectedIndex = 0;
 
-  static const int _thumbCount = 16;
-  static const double _baseTimelineWidth = 960.0;
+  // Undo / Redo Stacks
+  final List<EditorSnapshot> _undoStack = [];
+  final List<EditorSnapshot> _redoStack = [];
 
-  double get _totalTimelineWidth => _baseTimelineWidth * _zoomLevel;
+  static const int _thumbCount = 18;
+  double _pixelsPerSecond = 55.0; // Timeline အကျယ်
+
+  double get _maxOriginalDuration => _controller != null
+      ? _controller!.value.duration.inMilliseconds / 1000.0
+      : 1.0;
+
+  double get _totalActiveDuration =>
+      _segments.fold(0.0, (sum, seg) => sum + seg.duration);
+
+  double get _totalTimelineWidth =>
+      (_totalActiveDuration * _pixelsPerSecond).clamp(280.0, 20000.0);
 
   @override
   void dispose() {
     _controller?.dispose();
     _timelineScrollController.dispose();
     super.dispose();
+  }
+
+  void _saveStateForUndo() {
+    _undoStack.add(
+      EditorSnapshot(
+        segments: _segments.map((s) => s.copy()).toList(),
+        selectedIndex: _selectedIndex,
+      ),
+    );
+    _redoStack.clear();
+  }
+
+  void _undo() {
+    if (_undoStack.isEmpty) return;
+    _redoStack.add(
+      EditorSnapshot(
+        segments: _segments.map((s) => s.copy()).toList(),
+        selectedIndex: _selectedIndex,
+      ),
+    );
+    final prev = _undoStack.removeLast();
+    setState(() {
+      _segments = prev.segments;
+      _selectedIndex = prev.selectedIndex.clamp(0, _segments.length - 1);
+    });
+  }
+
+  void _redo() {
+    if (_redoStack.isEmpty) return;
+    _undoStack.add(
+      EditorSnapshot(
+        segments: _segments.map((s) => s.copy()).toList(),
+        selectedIndex: _selectedIndex,
+      ),
+    );
+    final next = _redoStack.removeLast();
+    setState(() {
+      _segments = next.segments;
+      _selectedIndex = next.selectedIndex.clamp(0, _segments.length - 1);
+    });
   }
 
   Future<void> _pickVideo() async {
@@ -84,18 +142,22 @@ class _CutterHomePageState extends State<CutterHomePage> {
 
       final controller = VideoPlayerController.file(File(path));
       await controller.initialize();
-
       final maxDur = controller.value.duration.inMilliseconds / 1000.0;
+
+      // ဗီဒီယို အရှည်ပေါ်မူတည်၍ Timeline အကျယ်ကို အလိုအလျောက် ချိန်ညှိပေးရန်
+      final autoPps = (900.0 / (maxDur > 0 ? maxDur : 10.0)).clamp(22.0, 90.0);
 
       controller.addListener(_onVideoTick);
 
       setState(() {
         _videoPath = path;
         _controller = controller;
-        _segments
-          ..clear()
-          ..add(VideoSegment(start: 0.0, end: maxDur));
-        _selectedSegmentIndex = 0;
+        _pixelsPerSecond = autoPps;
+        _isMuted = false;
+        _segments = [VideoSegment(start: 0.0, end: maxDur)];
+        _selectedIndex = 0;
+        _undoStack.clear();
+        _redoStack.clear();
         _statusMessage = '';
         _thumbnails
           ..clear()
@@ -111,24 +173,48 @@ class _CutterHomePageState extends State<CutterHomePage> {
   }
 
   void _onVideoTick() {
-    if (!mounted || _controller == null) return;
+    if (!mounted || _controller == null || _segments.isEmpty) return;
     final posSec = _controller!.value.position.inMilliseconds / 1000.0;
-    final maxDur = _controller!.value.duration.inMilliseconds / 1000.0;
 
-    if (!_isUserScrolling &&
-        _controller!.value.isPlaying &&
-        _timelineScrollController.hasClients &&
-        maxDur > 0) {
-      final targetOffset =
-          (posSec / maxDur).clamp(0.0, 1.0) * _totalTimelineWidth;
-      _timelineScrollController.jumpTo(targetOffset);
-    }
+    if (_controller!.value.isPlaying && !_isUserScrolling) {
+      // ဖျက်ထားသော အပိုင်းများကို ကျော်ပြီး ချန်ထားသော Segment များအတိုင်း Play ပေးရန်
+      int foundIdx = -1;
+      double accumulatedBefore = 0.0;
 
-    // လက်ရှိ Playhead ရောက်နေသော Segment ကို အလိုအလျောက် ရွေးပေးရန်
-    for (int i = 0; i < _segments.length; i++) {
-      if (posSec >= _segments[i].start && posSec <= _segments[i].end) {
-        _selectedSegmentIndex = i;
-        break;
+      for (int i = 0; i < _segments.length; i++) {
+        final s = _segments[i];
+        if (posSec >= s.start - 0.05 && posSec <= s.end + 0.05) {
+          foundIdx = i;
+          break;
+        }
+        accumulatedBefore += s.duration;
+      }
+
+      if (foundIdx != -1) {
+        _selectedIndex = foundIdx;
+        final seg = _segments[foundIdx];
+        final activePos =
+            accumulatedBefore + (posSec - seg.start).clamp(0.0, seg.duration);
+        if (_timelineScrollController.hasClients && _totalActiveDuration > 0) {
+          final targetOffset =
+              (activePos / _totalActiveDuration) * _totalTimelineWidth;
+          _timelineScrollController.jumpTo(targetOffset);
+        }
+      } else {
+        // ဖျက်လိုက်သော အပိုင်းထဲ ရောက်သွားပါက နောက် Segment အစသို့ ချက်ချင်း ခုန်ကူးရန်
+        VideoSegment? nextSeg;
+        for (int i = 0; i < _segments.length; i++) {
+          if (_segments[i].start > posSec) {
+            nextSeg = _segments[i];
+            _selectedIndex = i;
+            break;
+          }
+        }
+        if (nextSeg != null) {
+          _seekToVideoSec(nextSeg.start);
+        } else {
+          _controller!.pause();
+        }
       }
     }
 
@@ -138,12 +224,12 @@ class _CutterHomePageState extends State<CutterHomePage> {
   Future<void> _generateThumbnails(String videoPath, double maxDur) async {
     if (maxDur <= 0) return;
     final tempDir = await getTemporaryDirectory();
-    final sessionStamp = DateTime.now().millisecondsSinceEpoch;
+    final stamp = DateTime.now().millisecondsSinceEpoch;
 
     for (int i = 0; i < _thumbCount; i++) {
       if (!mounted || _videoPath != videoPath) return;
       final timeSec = (maxDur / _thumbCount) * i;
-      final outPath = '${tempDir.path}/thumb_${sessionStamp}_$i.jpg';
+      final outPath = '${tempDir.path}/thumb_${stamp}_$i.jpg';
 
       final cmd =
           '-y -ss ${timeSec.toStringAsFixed(2)} -i "$videoPath" -frames:v 1 -vf "scale=160:90" -q:v 5 "$outPath"';
@@ -160,47 +246,59 @@ class _CutterHomePageState extends State<CutterHomePage> {
     }
   }
 
-  void _seekToSeconds(double targetSec) {
+  void _seekToVideoSec(double sec) {
     if (_controller == null) return;
-    final maxDur = _controller!.value.duration.inMilliseconds / 1000.0;
-    final clamped = targetSec.clamp(0.0, maxDur);
+    final clamped = sec.clamp(0.0, _maxOriginalDuration);
     _controller!.seekTo(Duration(milliseconds: (clamped * 1000).toInt()));
   }
 
-  void _seekRelative(double offsetSeconds) {
-    if (_controller == null) return;
-    final currentSec = _controller!.value.position.inMilliseconds / 1000.0;
-    final maxDur = _controller!.value.duration.inMilliseconds / 1000.0;
-    final targetSec = (currentSec + offsetSeconds).clamp(0.0, maxDur);
-    _seekToSeconds(targetSec);
+  // Timeline Offset မှ ဗီဒီယို၏ အချိန်အမှန်သို့ တွက်ချက်ပေးခြင်း
+  double _offsetToVideoSeconds(double scrollOffset) {
+    if (_segments.isEmpty || _totalTimelineWidth <= 0) return 0.0;
+    final ratio = (scrollOffset / _totalTimelineWidth).clamp(0.0, 1.0);
+    final targetActiveSec = ratio * _totalActiveDuration;
 
-    if (_timelineScrollController.hasClients && maxDur > 0) {
-      _timelineScrollController
-          .jumpTo((targetSec / maxDur) * _totalTimelineWidth);
+    double acc = 0.0;
+    for (int i = 0; i < _segments.length; i++) {
+      final seg = _segments[i];
+      if (targetActiveSec <= acc + seg.duration || i == _segments.length - 1) {
+        _selectedIndex = i;
+        final localOffset = (targetActiveSec - acc).clamp(0.0, seg.duration);
+        return seg.start + localOffset;
+      }
+      acc += seg.duration;
     }
+    return _segments.last.end;
+  }
+
+  // လက်ရှိ Playhead ရောက်နေသော Timeline အချိန်
+  double _currentTimelinePosition() {
+    if (_controller == null || _segments.isEmpty) return 0.0;
+    final posSec = _controller!.value.position.inMilliseconds / 1000.0;
+    double acc = 0.0;
+    for (final seg in _segments) {
+      if (posSec >= seg.start && posSec <= seg.end) {
+        return acc + (posSec - seg.start);
+      }
+      acc += seg.duration;
+    }
+    return acc.clamp(0.0, _totalActiveDuration);
   }
 
   void _splitAtPlayhead() {
-    if (_controller == null) return;
+    if (_controller == null || _segments.isEmpty) return;
     final posSec = _controller!.value.position.inMilliseconds / 1000.0;
 
     for (int i = 0; i < _segments.length; i++) {
       final seg = _segments[i];
-      if (posSec > seg.start + 0.25 && posSec < seg.end - 0.25) {
+      if (posSec > seg.start + 0.2 && posSec < seg.end - 0.2) {
+        _saveStateForUndo();
         setState(() {
-          final firstPart = VideoSegment(
-            start: seg.start,
-            end: posSec,
-            isDeleted: seg.isDeleted,
-          );
-          final secondPart = VideoSegment(
-            start: posSec,
-            end: seg.end,
-            isDeleted: seg.isDeleted,
-          );
-          _segments[i] = firstPart;
-          _segments.insert(i + 1, secondPart);
-          _selectedSegmentIndex = i + 1;
+          final first = VideoSegment(start: seg.start, end: posSec);
+          final second = VideoSegment(start: posSec, end: seg.end);
+          _segments[i] = first;
+          _segments.insert(i + 1, second);
+          _selectedIndex = i + 1;
         });
         return;
       }
@@ -208,74 +306,178 @@ class _CutterHomePageState extends State<CutterHomePage> {
 
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
-        content: Text('ဖြတ်မည့်နေရာသည် အစ/အဆုံးနှင့် အနည်းဆုံး 0.25s ကွာရပါမည်'),
-        duration: Duration(seconds: 1),
+        content: Text('ဖြတ်မည့်နေရာသည် အပိုင်းအစ/အဆုံးနှင့် အနည်းငယ် ကွာရပါမည်'),
+        duration: Duration(milliseconds: 900),
       ),
     );
   }
 
-  void _toggleDeleteSelectedSegment() {
-    if (_segments.isEmpty) return;
-    setState(() {
-      final seg = _segments[_selectedSegmentIndex];
-      seg.isDeleted = !seg.isDeleted;
-    });
-  }
-
-  void _resetSplits() {
-    if (_controller == null) return;
-    final maxDur = _controller!.value.duration.inMilliseconds / 1000.0;
-    setState(() {
-      _segments
-        ..clear()
-        ..add(VideoSegment(start: 0.0, end: maxDur));
-      _selectedSegmentIndex = 0;
-    });
-  }
-
-  String _formatBadgeTime(double sec) {
-    final int mins = sec ~/ 60;
-    final int secs = (sec % 60).floor();
-    return '${mins.toString().padLeft(2, '0')}:${secs.toString().padLeft(2, '0')}';
-  }
-
-  String _formatPreciseTime(double sec) {
-    final int mins = sec ~/ 60;
-    final double rem = sec % 60;
-    return '${mins.toString().padLeft(2, '0')}:${rem.toStringAsFixed(2).padLeft(5, '0')}';
-  }
-
-  Future<void> _exportClips({required bool merge}) async {
-    final keptSegments = _segments.where((s) => !s.isDeleted).toList();
-    if (_videoPath == null || keptSegments.isEmpty) {
+  void _deleteSelectedSegment() {
+    if (_segments.length <= 1) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('ထုတ်ယူရန် ချန်ထားသော အပိုင်း မရှိပါ')),
+        const SnackBar(
+          content: Text('အပိုင်း (၁) ပိုင်းတည်းသာ ကျန်တော့သဖြင့် အရင် Split ပိုင်းပေးပါ'),
+          duration: Duration(milliseconds: 1100),
+        ),
       );
       return;
     }
 
+    _saveStateForUndo();
+    setState(() {
+      _segments.removeAt(_selectedIndex);
+      if (_selectedIndex >= _segments.length) {
+        _selectedIndex = _segments.length - 1;
+      }
+    });
+
+    final targetSeg = _segments[_selectedIndex];
+    _seekToVideoSec(targetSeg.start);
+  }
+
+  void _toggleMute() {
+    if (_controller == null) return;
+    setState(() {
+      _isMuted = !_isMuted;
+      _controller!.setVolume(_isMuted ? 0.0 : 1.0);
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          _isMuted
+              ? '🔇 ဗီဒီယိုအသံ ပိတ်ထားပါသည် (Export ထုတ်လျှင်လည်း အသံပါမည်မဟုတ်ပါ)'
+              : '🔊 ဗီဒီယိုအသံ ပြန်ဖွင့်ထားပါသည်',
+        ),
+        duration: const Duration(milliseconds: 1000),
+      ),
+    );
+  }
+
+  void _showZoomAndSpeedSheet() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1A1A1A),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setModalState) {
+            return Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Timeline အကျယ် ချိန်ညှိရန် (Zoom)',
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                  ),
+                  Slider(
+                    value: _pixelsPerSecond,
+                    min: 20.0,
+                    max: 160.0,
+                    activeColor: const Color(0xFF00E5FF),
+                    onChanged: (val) {
+                      setModalState(() => _pixelsPerSecond = val);
+                      setState(() => _pixelsPerSecond = val);
+                    },
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  void _showExportSheet() {
+    if (_videoPath == null || _segments.isEmpty) return;
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1A1A1A),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) {
+        return Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Text(
+                '⚡ Lossless Export (ဖိုင်ဆိုဒ် လုံးဝမတက်ပါ)',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                'ကျန်ရှိသော အပိုင်း (${_segments.length}) ပိုင်း • စုစုပေါင်းကြာချိန် ${_formatClock(_totalActiveDuration)}',
+                style: const TextStyle(color: Colors.grey, fontSize: 13),
+              ),
+              const SizedBox(height: 16),
+              ElevatedButton.icon(
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  _exportClips(merge: true);
+                },
+                icon: const Icon(Icons.merge_type),
+                label: const Text('တစ်ဆက်တည်း ပေါင်းထုတ်မည် (Cut & Merge)'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF00E5FF),
+                  foregroundColor: Colors.black,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                ),
+              ),
+              const SizedBox(height: 10),
+              OutlinedButton.icon(
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  _exportClips(merge: false);
+                },
+                icon: const Icon(Icons.content_cut, color: Colors.white),
+                label: Text(
+                  'တစ်ပိုင်းစီ သီးခြားထုတ်မည် (${_segments.length} ဖိုင်)',
+                  style: const TextStyle(color: Colors.white),
+                ),
+                style: OutlinedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  side: const BorderSide(color: Colors.white38),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _exportClips({required bool merge}) async {
+    if (_videoPath == null || _segments.isEmpty) return;
+
     setState(() {
       _isProcessing = true;
-      _statusMessage = '⏳ Lossless (-c copy) စနစ်ဖြင့် ဖြတ်ထုတ်နေပါသည်...';
+      _statusMessage = '⏳ Lossless (-c copy) ဖြင့် ဖြတ်ထုတ်နေပါသည်...';
     });
 
     try {
       final tempDir = await getTemporaryDirectory();
       final timestamp = DateTime.now().millisecondsSinceEpoch;
       final List<String> tempOutputs = [];
+      final audioFlag = _isMuted ? '-an' : '';
 
-      for (int i = 0; i < keptSegments.length; i++) {
-        final clip = keptSegments[i];
-        final duration = (clip.end - clip.start).toStringAsFixed(2);
+      for (int i = 0; i < _segments.length; i++) {
+        final clip = _segments[i];
+        final duration = clip.duration.toStringAsFixed(2);
         final outPath = '${tempDir.path}/cut_${timestamp}_${i + 1}.mp4';
 
         final cmd =
-            '-y -ss ${clip.start.toStringAsFixed(2)} -i "$_videoPath" -t $duration -c copy -avoid_negative_ts make_zero "$outPath"';
+            '-y -ss ${clip.start.toStringAsFixed(2)} -i "$_videoPath" -t $duration -c copy $audioFlag -avoid_negative_ts make_zero "$outPath"';
 
         final session = await FFmpegKit.execute(cmd);
-        final returnCode = await session.getReturnCode();
-
-        if (!ReturnCode.isSuccess(returnCode)) {
+        final rc = await session.getReturnCode();
+        if (!ReturnCode.isSuccess(rc)) {
           throw Exception('အပိုင်း ${i + 1} ဖြတ်ရာတွင် အမှားဖြစ်ပေါ်ပါသည်');
         }
         tempOutputs.add(outPath);
@@ -291,8 +493,8 @@ class _CutterHomePageState extends State<CutterHomePage> {
             '-y -f concat -safe 0 -i "${listFile.path}" -c copy "$mergedPath"';
 
         final session = await FFmpegKit.execute(mergeCmd);
-        final returnCode = await session.getReturnCode();
-        if (!ReturnCode.isSuccess(returnCode)) {
+        final rc = await session.getReturnCode();
+        if (!ReturnCode.isSuccess(rc)) {
           throw Exception('ဗီဒီယို ပြန်ဆက်ရာတွင် အမှားဖြစ်ပေါ်ပါသည်');
         }
 
@@ -300,7 +502,7 @@ class _CutterHomePageState extends State<CutterHomePage> {
         final sizeMb = (await File(mergedPath).length()) / (1024 * 1024);
         setState(() {
           _statusMessage =
-              '✅ ချန်ထားသော (${keptSegments.length}) ပိုင်းကို ပေါင်းပြီး Gallery (LosslessCuts) ထဲသို့ သိမ်းပြီးပါပြီ!\nFile Size: ${sizeMb.toStringAsFixed(2)} MB';
+              '✅ Gallery (LosslessCuts) ထဲသို့ သိမ်းပြီးပါပြီ! (${sizeMb.toStringAsFixed(2)} MB)';
         });
       } else {
         double totalMb = 0;
@@ -310,7 +512,7 @@ class _CutterHomePageState extends State<CutterHomePage> {
         }
         setState(() {
           _statusMessage =
-              '✅ ဗီဒီယို (${tempOutputs.length}) ဖိုင်ကို Gallery (LosslessCuts) ထဲသို့ သိမ်းပြီးပါပြီ!\nစုစုပေါင်း File Size: ${totalMb.toStringAsFixed(2)} MB';
+              '✅ (${tempOutputs.length}) ဖိုင်ကို Gallery ထဲသို့ သိမ်းပြီးပါပြီ! (စုစုပေါင်း ${totalMb.toStringAsFixed(2)} MB)';
         });
       }
     } catch (e) {
@@ -324,16 +526,151 @@ class _CutterHomePageState extends State<CutterHomePage> {
     }
   }
 
-  Widget _buildCapCutTimeline(double maxDur, double currentPos) {
+  String _formatClock(double sec) {
+    final int mins = sec ~/ 60;
+    final int secs = (sec % 60).floor();
+    return '${mins.toString().padLeft(2, '0')}:${secs.toString().padLeft(2, '0')}';
+  }
+
+  // CapCut ပုံစံ Segment Thumbnail နှင့် အဖြူရောင် Handle ဘောင်များ
+  Widget _buildSegmentBlock(int index, VideoSegment seg) {
+    final double segWidth =
+        (seg.duration * _pixelsPerSecond).clamp(38.0, 20000.0);
+    final bool isSelected = index == _selectedIndex;
+    final int tileCount = (segWidth / 54.0).ceil().clamp(1, 40);
+
+    return GestureDetector(
+      onTap: () {
+        setState(() {
+          _selectedIndex = index;
+        });
+      },
+      child: Container(
+        width: segWidth,
+        height: 62,
+        margin: const EdgeInsets.only(right: 2),
+        child: Stack(
+          children: [
+            // Segment အတွင်းမှ ဗီဒီယို Frame များ
+            ClipRRect(
+              borderRadius: BorderRadius.circular(isSelected ? 5 : 3),
+              child: Row(
+                children: List.generate(tileCount, (tIdx) {
+                  final sampleSec =
+                      seg.start + ((tIdx + 0.3) / tileCount) * seg.duration;
+                  final int thumbIdx = _maxOriginalDuration > 0
+                      ? ((sampleSec / _maxOriginalDuration) * _thumbCount)
+                          .floor()
+                          .clamp(0, _thumbCount - 1)
+                      : 0;
+                  final thumbPath = thumbIdx < _thumbnails.length
+                      ? _thumbnails[thumbIdx]
+                      : null;
+
+                  return Expanded(
+                    child: Container(
+                      height: 62,
+                      color: const Color(0xFF222222),
+                      child: thumbPath != null
+                          ? Image.file(
+                              File(thumbPath),
+                              fit: BoxFit.cover,
+                            )
+                          : const SizedBox.shrink(),
+                    ),
+                  );
+                }),
+              ),
+            ),
+
+            // ရွေးထားသည့် Segment တွင် CapCut အတိုင်း အဖြူရောင် ဘယ်/ညာ Handle ပြသခြင်း
+            if (isSelected)
+              Positioned.fill(
+                child: Container(
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(5),
+                    border: Border.all(color: Colors.white, width: 2.0),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      // ဘယ်ဘက် Handle အဖြူတုံး
+                      Container(
+                        width: 12,
+                        height: double.infinity,
+                        decoration: const BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.horizontal(
+                            left: Radius.circular(3),
+                          ),
+                        ),
+                        child: Center(
+                          child: Container(
+                            width: 2,
+                            height: 16,
+                            color: Colors.black54,
+                          ),
+                        ),
+                      ),
+                      // ညာဘက် Handle အဖြူတုံး
+                      Container(
+                        width: 12,
+                        height: double.infinity,
+                        decoration: const BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.horizontal(
+                            right: Radius.circular(3),
+                          ),
+                        ),
+                        child: Center(
+                          child: Container(
+                            width: 2,
+                            height: 16,
+                            color: Colors.black54,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+            // ကြာချိန်ပြသသော စာသား (ဥပမာ - "3.9s")
+            Positioned(
+              top: 4,
+              left: isSelected ? 16 : 6,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.circular(3),
+                ),
+                child: Text(
+                  '${seg.duration.toStringAsFixed(1)}s',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 10.5,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // CapCut အလယ်ပိုင်း Multi-Track Timeline Area
+  Widget _buildCapCutTimelineArea() {
     final screenWidth = MediaQuery.of(context).size.width;
     final halfScreen = screenWidth / 2;
+    final totalSecs = _totalActiveDuration.ceil().clamp(1, 3600);
 
-    return SizedBox(
-      height: 118,
+    return Expanded(
       child: Stack(
-        alignment: Alignment.center,
+        alignment: Alignment.topCenter,
         children: [
-          // အနောက်ခံ Scrollable Filmstrip Timeline
           NotificationListener<ScrollNotification>(
             onNotification: (notification) {
               if (notification is ScrollStartNotification &&
@@ -343,12 +680,11 @@ class _CutterHomePageState extends State<CutterHomePage> {
                   _controller!.pause();
                 }
               } else if (notification is ScrollUpdateNotification &&
-                  _isUserScrolling &&
-                  maxDur > 0) {
-                final ratio = (_timelineScrollController.offset /
-                        _totalTimelineWidth)
-                    .clamp(0.0, 1.0);
-                _seekToSeconds(ratio * maxDur);
+                  _isUserScrolling) {
+                final targetVideoSec = _offsetToVideoSeconds(
+                  _timelineScrollController.offset,
+                );
+                _seekToVideoSec(targetVideoSec);
               } else if (notification is ScrollEndNotification) {
                 _isUserScrolling = false;
               }
@@ -359,167 +695,230 @@ class _CutterHomePageState extends State<CutterHomePage> {
               scrollDirection: Axis.horizontal,
               physics: const ClampingScrollPhysics(),
               child: Padding(
-                padding: EdgeInsets.symmetric(horizontal: halfScreen),
-                child: Row(
+                padding: EdgeInsets.only(
+                  left: halfScreen - 56,
+                  right: halfScreen,
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    SizedBox(
-                      width: _totalTimelineWidth,
-                      height: 82,
-                      child: Stack(
-                        children: [
-                          // 1. ဗီဒီယို Frame Thumbnail အတန်း
-                          ClipRRect(
-                            borderRadius: BorderRadius.circular(6),
-                            child: Row(
-                              children: List.generate(_thumbCount, (idx) {
-                                final thumbPath = idx < _thumbnails.length
-                                    ? _thumbnails[idx]
-                                    : null;
-                                return Expanded(
-                                  child: Container(
-                                    height: 82,
-                                    decoration: BoxDecoration(
-                                      color: const Color(0xFF262626),
-                                      border: Border(
-                                        right: BorderSide(
-                                          color: Colors.black.withAlpha(80),
-                                          width: 0.5,
-                                        ),
-                                      ),
-                                    ),
-                                    child: thumbPath != null
-                                        ? Image.file(
-                                            File(thumbPath),
-                                            fit: BoxFit.cover,
-                                          )
-                                        : const Center(
-                                            child: SizedBox(
-                                              width: 14,
-                                              height: 14,
-                                              child: CircularProgressIndicator(
-                                                strokeWidth: 1.5,
-                                              ),
-                                            ),
-                                          ),
-                                  ),
-                                );
-                              }),
-                            ),
-                          ),
-
-                          // 2. Split လုပ်ထားသော အပိုင်းများ (Segments Overlay)
-                          Row(
-                            children: _segments.asMap().entries.map((entry) {
-                              final idx = entry.key;
-                              final seg = entry.value;
-                              final segRatio = maxDur > 0
-                                  ? ((seg.end - seg.start) / maxDur)
-                                      .clamp(0.0, 1.0)
-                                  : 1.0;
-                              final segWidth = segRatio * _totalTimelineWidth;
-                              final isSelected = idx == _selectedSegmentIndex;
-
-                              return GestureDetector(
-                                onTap: () {
-                                  setState(() {
-                                    _selectedSegmentIndex = idx;
-                                  });
-                                },
-                                child: Container(
-                                  width: segWidth,
-                                  height: 82,
-                                  decoration: BoxDecoration(
-                                    color: seg.isDeleted
-                                        ? const Color(0xAAB71C1C)
-                                        : Colors.transparent,
-                                    border: Border(
-                                      left: BorderSide(
-                                        color: isSelected
-                                            ? Colors.white
-                                            : const Color(0xFF121212),
-                                        width: isSelected ? 2.5 : 2.0,
-                                      ),
-                                      right: BorderSide(
-                                        color: isSelected
-                                            ? Colors.white
-                                            : const Color(0xFF121212),
-                                        width: isSelected ? 2.5 : 2.0,
-                                      ),
-                                      top: BorderSide(
-                                        color: isSelected
-                                            ? Colors.white
-                                            : Colors.transparent,
-                                        width: 2.0,
-                                      ),
-                                      bottom: BorderSide(
-                                        color: isSelected
-                                            ? Colors.white
-                                            : Colors.transparent,
-                                        width: 2.0,
-                                      ),
+                    // 1. အချိန်ပြ ပေတံတန်း (00:00 • 00:01 • 00:02)
+                    Padding(
+                      padding: const EdgeInsets.only(left: 56, bottom: 8),
+                      child: SizedBox(
+                        width: _totalTimelineWidth + 80,
+                        height: 20,
+                        child: Row(
+                          children: List.generate(totalSecs + 1, (sec) {
+                            return SizedBox(
+                              width: _pixelsPerSecond,
+                              child: Row(
+                                mainAxisAlignment:
+                                    MainAxisAlignment.spaceBetween,
+                                children: [
+                                  Text(
+                                    _formatClock(sec.toDouble()),
+                                    style: const TextStyle(
+                                      color: Colors.white54,
+                                      fontSize: 10,
                                     ),
                                   ),
-                                  child: Stack(
-                                    children: [
-                                      if (idx == 0)
-                                        Positioned(
-                                          top: 5,
-                                          left: 6,
-                                          child: Container(
-                                            padding: const EdgeInsets.symmetric(
-                                              horizontal: 6,
-                                              vertical: 2,
-                                            ),
-                                            decoration: BoxDecoration(
-                                              color: const Color(0x99000000),
-                                              borderRadius:
-                                                  BorderRadius.circular(4),
-                                            ),
-                                            child: Text(
-                                              _formatBadgeTime(maxDur),
-                                              style: const TextStyle(
-                                                color: Colors.white,
-                                                fontSize: 12,
-                                                fontWeight: FontWeight.bold,
-                                              ),
-                                            ),
-                                          ),
-                                        ),
-                                      if (seg.isDeleted)
-                                        const Center(
-                                          child: Icon(
-                                            Icons.delete_forever,
-                                            color: Colors.white,
-                                            size: 26,
-                                          ),
-                                        ),
-                                    ],
+                                  const Text(
+                                    '•',
+                                    style: TextStyle(
+                                      color: Colors.white38,
+                                      fontSize: 10,
+                                    ),
                                   ),
-                                ),
-                              );
-                            }).toList(),
-                          ),
-                        ],
+                                  const SizedBox(width: 4),
+                                ],
+                              ),
+                            );
+                          }),
+                        ),
                       ),
                     ),
 
-                    // 3. ညာဘက်အစွန်မှ "+" ခလုတ်
-                    const SizedBox(width: 8),
-                    GestureDetector(
-                      onTap: _pickVideo,
-                      child: Container(
-                        width: 44,
-                        height: 44,
-                        decoration: BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.circular(8),
+                    // 2. Cover ခလုတ် + Video Filmstrip + ညာဘက် "+" ခလုတ်
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
+                        // Cover ခလုတ်
+                        Container(
+                          width: 48,
+                          height: 62,
+                          margin: const EdgeInsets.only(right: 8),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF1F1F1F),
+                            borderRadius: BorderRadius.circular(6),
+                            image: _thumbnails.isNotEmpty &&
+                                    _thumbnails.first != null
+                                ? DecorationImage(
+                                    image: FileImage(File(_thumbnails.first!)),
+                                    fit: BoxFit.cover,
+                                    colorFilter: const ColorFilter.mode(
+                                      Colors.black45,
+                                      BlendMode.darken,
+                                    ),
+                                  )
+                                : null,
+                          ),
+                          child: const Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(Icons.edit_outlined,
+                                  size: 16, color: Colors.white),
+                              SizedBox(height: 2),
+                              Text(
+                                'Cover',
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
-                        child: const Icon(
-                          Icons.add,
-                          color: Colors.black87,
-                          size: 28,
+
+                        // Video Segments အတန်း
+                        Row(
+                          children: _segments
+                              .asMap()
+                              .entries
+                              .map((e) => _buildSegmentBlock(e.key, e.value))
+                              .toList(),
                         ),
+
+                        // ညာဘက်အစွန် "+" ခလုတ်
+                        const SizedBox(width: 8),
+                        GestureDetector(
+                          onTap: _pickVideo,
+                          child: Container(
+                            width: 38,
+                            height: 38,
+                            decoration: BoxDecoration(
+                              color: Colors.white,
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            child: const Icon(
+                              Icons.add,
+                              color: Colors.black,
+                              size: 24,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+
+                    const SizedBox(height: 12),
+
+                    // 3. "+ Add audio" Track Row
+                    Row(
+                      children: [
+                        Container(
+                          width: 40,
+                          height: 36,
+                          margin: const EdgeInsets.only(right: 16),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF1C1C1C),
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                          child: Icon(
+                            _isMuted ? Icons.music_off : Icons.music_note,
+                            size: 18,
+                            color: _isMuted ? Colors.redAccent : Colors.white54,
+                          ),
+                        ),
+                        GestureDetector(
+                          onTap: _toggleMute,
+                          child: Container(
+                            width: _totalTimelineWidth,
+                            height: 36,
+                            padding: const EdgeInsets.symmetric(horizontal: 12),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF1C1C1C),
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            alignment: Alignment.centerLeft,
+                            child: Text(
+                              _isMuted
+                                  ? '🔇 Original Audio Muted (ပြန်ဖွင့်ရန် နှိပ်ပါ)'
+                                  : '+ Add audio (မူရင်းအသံ ပိတ်/ဖွင့်ရန် နှိပ်ပါ)',
+                              style: const TextStyle(
+                                color: Colors.white60,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+
+                    const SizedBox(height: 8),
+
+                    // 4. "+ Add text" Track Row
+                    Row(
+                      children: [
+                        Container(
+                          width: 40,
+                          height: 36,
+                          margin: const EdgeInsets.only(right: 16),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF1C1C1C),
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                          child: const Icon(
+                            Icons.text_fields,
+                            size: 18,
+                            color: Colors.white54,
+                          ),
+                        ),
+                        Container(
+                          width: _totalTimelineWidth,
+                          height: 36,
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF1C1C1C),
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                          alignment: Alignment.centerLeft,
+                          child: const Text(
+                            '+ Add text',
+                            style: TextStyle(
+                              color: Colors.white60,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+
+          // ဘယ်ဘက်ထောင့်ရှိ လက်ရှိအချိန် / စုစုပေါင်းအချိန် ("00:02 / 01:06")
+          Positioned(
+            top: 0,
+            left: 12,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              color: const Color(0xFF0E0E0E),
+              child: RichText(
+                text: TextSpan(
+                  style: const TextStyle(fontSize: 11),
+                  children: [
+                    TextSpan(
+                      text: _formatClock(_currentTimelinePosition()),
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w600,
                       ),
+                    ),
+                    TextSpan(
+                      text: ' / ${_formatClock(_totalActiveDuration)}',
+                      style: const TextStyle(color: Colors.white54),
                     ),
                   ],
                 ),
@@ -528,19 +927,16 @@ class _CutterHomePageState extends State<CutterHomePage> {
           ),
 
           // အလယ်ဗဟိုရှိ အဖြူရောင် ဒေါင်လိုက် Playhead မျဉ်းကြောင်း
-          IgnorePointer(
-            child: Container(
-              width: 3,
-              height: 112,
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(2),
-                boxShadow: const [
-                  BoxShadow(
-                    color: Colors.black54,
-                    blurRadius: 4,
-                  ),
-                ],
+          Positioned(
+            top: 22,
+            bottom: 8,
+            child: IgnorePointer(
+              child: Container(
+                width: 2.2,
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(2),
+                ),
               ),
             ),
           ),
@@ -549,328 +945,288 @@ class _CutterHomePageState extends State<CutterHomePage> {
     );
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final currentPos = _controller != null
-        ? _controller!.value.position.inMilliseconds / 1000.0
-        : 0.0;
-    final maxDur = _controller != null
-        ? _controller!.value.duration.inMilliseconds / 1000.0
-        : 1.0;
-
-    final selectedSeg =
-        _segments.isNotEmpty && _selectedSegmentIndex < _segments.length
-            ? _segments[_selectedSegmentIndex]
-            : null;
-
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('⚡ Lossless Split Cutter'),
-        backgroundColor: const Color(0xFF1E1E1E),
-        actions: [
-          if (_controller != null)
-            TextButton.icon(
-              onPressed: _resetSplits,
-              icon: const Icon(Icons.refresh, color: Colors.orangeAccent),
-              label: const Text(
-                'Reset',
-                style: TextStyle(color: Colors.orangeAccent),
-              ),
+  // အောက်ဆုံး CapCut Toolbar (Split, Volume, Animations, Effects, Delete, Speed)
+  Widget _buildBottomCapCutBar() {
+    return Container(
+      height: 68,
+      decoration: const BoxDecoration(
+        color: Color(0xFF141414),
+        border: Border(
+          top: BorderSide(color: Colors.white10, width: 0.5),
+        ),
+      ),
+      child: Row(
+        children: [
+          // ဘယ်ဘက်အစွန် "<" ခလုတ်
+          Container(
+            width: 38,
+            height: 46,
+            margin: const EdgeInsets.only(left: 8, right: 4),
+            decoration: BoxDecoration(
+              color: const Color(0xFF222222),
+              borderRadius: BorderRadius.circular(6),
             ),
-          IconButton(
-            icon: const Icon(Icons.folder_open, color: Color(0xFF00E676)),
-            onPressed: _pickVideo,
-            tooltip: 'Video ရွေးရန်',
+            child: IconButton(
+              icon: const Icon(Icons.chevron_left, color: Colors.white70),
+              onPressed: _pickVideo,
+              tooltip: 'ဗီဒီယို အသစ်ရွေးရန်',
+            ),
+          ),
+
+          // အဓိက Tool ခလုတ်များ
+          Expanded(
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                _buildToolItem(
+                  icon: Icons.vertical_split,
+                  label: 'Split',
+                  onTap: _splitAtPlayhead,
+                ),
+                _buildToolItem(
+                  icon: _isMuted ? Icons.volume_off : Icons.volume_up_outlined,
+                  label: 'Volume',
+                  onTap: _toggleMute,
+                ),
+                _buildToolItem(
+                  icon: Icons.slideshow_outlined,
+                  label: 'Animations',
+                  onTap: _showZoomAndSpeedSheet,
+                ),
+                _buildToolItem(
+                  icon: Icons.auto_awesome_outlined,
+                  label: 'Effects',
+                  onTap: _showZoomAndSpeedSheet,
+                ),
+                _buildToolItem(
+                  icon: Icons.delete_outline,
+                  label: 'Delete',
+                  onTap: _deleteSelectedSegment,
+                ),
+                _buildToolItem(
+                  icon: Icons.speed,
+                  label: 'Speed',
+                  onTap: _showZoomAndSpeedSheet,
+                ),
+              ],
+            ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildToolItem({
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(8),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, color: Colors.white, size: 22),
+            const SizedBox(height: 5),
+            Text(
+              label,
+              style: const TextStyle(color: Colors.white70, fontSize: 11),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      // အပေါ်ဆုံး CapCut Top Bar + Export ခလုတ်
+      appBar: PreferredSize(
+        preferredSize: const Size.fromHeight(46),
+        child: AppBar(
+          backgroundColor: const Color(0xFF0E0E0E),
+          elevation: 0,
+          leading: IconButton(
+            icon: const Icon(Icons.close, color: Colors.white, size: 22),
+            onPressed: _pickVideo,
+          ),
+          title: _statusMessage.isNotEmpty
+              ? Text(
+                  _statusMessage,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: Color(0xFF00E5FF),
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                )
+              : const Text(
+                  'Lossless 1080P',
+                  style: TextStyle(fontSize: 13, color: Colors.white70),
+                ),
+          centerTitle: true,
+          actions: [
+            if (_controller != null)
+              Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                child: ElevatedButton(
+                  onPressed: _isProcessing ? null : _showExportSheet,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF00E5FF),
+                    foregroundColor: Colors.black,
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                  ),
+                  child: const Text(
+                    'Export',
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 13,
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
       ),
       body: _controller == null
           ? Center(
               child: ElevatedButton.icon(
                 onPressed: _pickVideo,
-                icon: const Icon(Icons.video_library),
-                label: const Text('ဖုန်းထဲမှ Video ဖိုင်ရွေးမည်'),
+                icon: const Icon(Icons.add_circle_outline, color: Colors.black),
+                label: const Text(
+                  'New Project (ဗီဒီယို ရွေးမည်)',
+                  style: TextStyle(
+                    color: Colors.black,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
                 style: ElevatedButton.styleFrom(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+                  backgroundColor: const Color(0xFF00E5FF),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 28,
+                    vertical: 16,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10),
+                  ),
                 ),
               ),
             )
-          : SingleChildScrollView(
-              padding: const EdgeInsets.symmetric(vertical: 10),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  // Video Preview
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                    child: AspectRatio(
-                      aspectRatio: _controller!.value.aspectRatio,
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(8),
-                        child: VideoPlayer(_controller!),
+          : Column(
+              children: [
+                // 1. အပေါ်ပိုင်း Video Preview Area (Cyan ဘောင်နှင့်တကွ)
+                Expanded(
+                  flex: 5,
+                  child: Container(
+                    width: double.infinity,
+                    color: Colors.black,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 4,
+                    ),
+                    child: Center(
+                      child: AspectRatio(
+                        aspectRatio: _controller!.value.aspectRatio,
+                        child: Container(
+                          decoration: BoxDecoration(
+                            border: Border.all(
+                              color: const Color(0xFF00BCD4),
+                              width: 1.2,
+                            ),
+                          ),
+                          child: VideoPlayer(_controller!),
+                        ),
                       ),
                     ),
                   ),
-                  const SizedBox(height: 8),
+                ),
 
-                  // Play/Pause + အချိန်ပြတန်း
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Text(
-                          _formatPreciseTime(currentPos),
-                          style: const TextStyle(
-                            color: Color(0xFF00E676),
-                            fontWeight: FontWeight.bold,
+                // 2. အလယ်ပိုင်း Play/Pause နှင့် Undo / Redo Control Bar
+                Container(
+                  height: 46,
+                  padding: const EdgeInsets.symmetric(horizontal: 14),
+                  color: const Color(0xFF0E0E0E),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      IconButton(
+                        icon: const Icon(
+                          Icons.fullscreen,
+                          color: Colors.white70,
+                          size: 22,
+                        ),
+                        onPressed: () {},
+                      ),
+                      IconButton(
+                        iconSize: 30,
+                        icon: Icon(
+                          _controller!.value.isPlaying
+                              ? Icons.pause
+                              : Icons.play_arrow_outlined,
+                          color: Colors.white,
+                        ),
+                        onPressed: () {
+                          setState(() {
+                            _controller!.value.isPlaying
+                                ? _controller!.pause()
+                                : _controller!.play();
+                          });
+                        },
+                      ),
+                      Row(
+                        children: [
+                          const Icon(
+                            Icons.diamond_outlined,
+                            color: Colors.white60,
+                            size: 18,
                           ),
-                        ),
-                        Row(
-                          children: [
-                            TextButton(
-                              onPressed: () => _seekRelative(-0.5),
-                              child: const Text('-0.5s'),
-                            ),
-                            IconButton(
-                              iconSize: 38,
-                              icon: Icon(
-                                _controller!.value.isPlaying
-                                    ? Icons.pause_circle_filled
-                                    : Icons.play_circle_filled,
-                                color: Colors.white,
-                              ),
-                              onPressed: () {
-                                setState(() {
-                                  _controller!.value.isPlaying
-                                      ? _controller!.pause()
-                                      : _controller!.play();
-                                });
-                              },
-                            ),
-                            TextButton(
-                              onPressed: () => _seekRelative(0.5),
-                              child: const Text('+0.5s'),
-                            ),
-                          ],
-                        ),
-                        Text(
-                          _formatPreciseTime(maxDur),
-                          style: const TextStyle(color: Colors.grey),
-                        ),
-                      ],
-                    ),
-                  ),
-
-                  // CapCut-style Filmstrip Timeline
-                  Container(
-                    color: const Color(0xFF181818),
-                    padding: const EdgeInsets.symmetric(vertical: 8),
-                    child: _buildCapCutTimeline(maxDur, currentPos),
-                  ),
-
-                  // Timeline Zoom Slider
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16),
-                    child: Row(
-                      children: [
-                        const Icon(Icons.zoom_in, size: 18, color: Colors.grey),
-                        const SizedBox(width: 8),
-                        const Text(
-                          'Timeline အကျယ်ချဲ့ရန်:',
-                          style: TextStyle(fontSize: 12, color: Colors.grey),
-                        ),
-                        Expanded(
-                          child: Slider(
-                            value: _zoomLevel,
-                            min: 1.0,
-                            max: 4.0,
-                            onChanged: (val) {
-                              final ratio = maxDur > 0
-                                  ? (currentPos / maxDur).clamp(0.0, 1.0)
-                                  : 0.0;
-                              setState(() {
-                                _zoomLevel = val;
-                              });
-                              WidgetsBinding.instance
-                                  .addPostFrameCallback((_) {
-                                if (_timelineScrollController.hasClients) {
-                                  _timelineScrollController
-                                      .jumpTo(ratio * _totalTimelineWidth);
-                                }
-                              });
-                            },
-                          ),
-                        ),
-                        Text(
-                          '${_zoomLevel.toStringAsFixed(1)}x',
-                          style: const TextStyle(
-                            fontSize: 12,
-                            color: Colors.grey,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-
-                  // Split နှင့် Delete Toolbar (CapCut Bottom Action Bar ပုံစံ)
-                  Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 6,
-                    ),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: ElevatedButton.icon(
-                            onPressed: _splitAtPlayhead,
-                            icon: const Icon(Icons.content_cut),
-                            label: const Text('Split (ဖြတ်မည်)'),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: const Color(0xFF2979FF),
-                              foregroundColor: Colors.white,
-                              padding: const EdgeInsets.symmetric(vertical: 12),
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: ElevatedButton.icon(
-                            onPressed: selectedSeg == null
-                                ? null
-                                : _toggleDeleteSelectedSegment,
+                          const SizedBox(width: 8),
+                          IconButton(
                             icon: Icon(
-                              selectedSeg?.isDeleted == true
-                                  ? Icons.restore_from_trash
-                                  : Icons.delete_outline,
+                              Icons.undo,
+                              color: _undoStack.isNotEmpty
+                                  ? Colors.white
+                                  : Colors.white24,
+                              size: 21,
                             ),
-                            label: Text(
-                              selectedSeg?.isDeleted == true
-                                  ? 'ပြန်ယူမည် (Restore)'
-                                  : 'ရွေးထားသောအပိုင်း ဖျက်မည်',
-                            ),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: selectedSeg?.isDeleted == true
-                                  ? Colors.orange.shade800
-                                  : Colors.redAccent.shade700,
-                              foregroundColor: Colors.white,
-                              padding: const EdgeInsets.symmetric(vertical: 12),
-                            ),
+                            onPressed: _undoStack.isNotEmpty ? _undo : null,
+                            tooltip: 'Undo (နောက်ပြန်ဆုတ်ရန်)',
                           ),
-                        ),
-                      ],
-                    ),
-                  ),
-
-                  // ဖြတ်ထားသော အပိုင်းများ စာရင်း
-                  Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: 6,
-                    ),
-                    child: Text(
-                      'ဖြတ်ထားသော အပိုင်းများ (${_segments.where((s) => !s.isDeleted).length} / ${_segments.length} ပိုင်း ချန်ထားသည်):',
-                      style: const TextStyle(
-                        fontWeight: FontWeight.bold,
-                        fontSize: 14,
+                          IconButton(
+                            icon: Icon(
+                              Icons.redo,
+                              color: _redoStack.isNotEmpty
+                                  ? Colors.white
+                                  : Colors.white24,
+                              size: 21,
+                            ),
+                            onPressed: _redoStack.isNotEmpty ? _redo : null,
+                            tooltip: 'Redo (ရှေ့ပြန်တိုးရန်)',
+                          ),
+                        ],
                       ),
-                    ),
+                    ],
                   ),
+                ),
 
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                    child: Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: _segments.asMap().entries.map((entry) {
-                        final idx = entry.key;
-                        final seg = entry.value;
-                        final isSelected = idx == _selectedSegmentIndex;
-                        final dur = (seg.end - seg.start).toStringAsFixed(1);
-
-                        return ChoiceChip(
-                          label: Text(
-                            'အပိုင်း ${idx + 1} (${dur}s)${seg.isDeleted ? " [ဖျက်ထား]" : ""}',
-                          ),
-                          selected: isSelected,
-                          selectedColor: seg.isDeleted
-                              ? Colors.red.shade900
-                              : const Color(0xFF00C853),
-                          onSelected: (_) {
-                            setState(() {
-                              _selectedSegmentIndex = idx;
-                            });
-                            _seekToSeconds(seg.start + 0.05);
-                            if (_timelineScrollController.hasClients &&
-                                maxDur > 0) {
-                              _timelineScrollController.jumpTo(
-                                (seg.start / maxDur) * _totalTimelineWidth,
-                              );
-                            }
-                          },
-                        );
-                      }).toList(),
-                    ),
+                // 3. အောက်ပိုင်း CapCut Multi-Track Timeline
+                Expanded(
+                  flex: 4,
+                  child: Column(
+                    children: [
+                      _buildCapCutTimelineArea(),
+                      _buildBottomCapCutBar(),
+                    ],
                   ),
-
-                  const SizedBox(height: 16),
-
-                  // Export ခလုတ် ၂ ခု
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: ElevatedButton.icon(
-                            onPressed: _isProcessing
-                                ? null
-                                : () => _exportClips(merge: false),
-                            icon: const Icon(Icons.file_download),
-                            label: const Text('သီးခြားစီ ထုတ်မည်'),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: const Color(0xFF00C853),
-                              foregroundColor: Colors.white,
-                              padding: const EdgeInsets.symmetric(vertical: 12),
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: ElevatedButton.icon(
-                            onPressed: _isProcessing
-                                ? null
-                                : () => _exportClips(merge: true),
-                            icon: const Icon(Icons.merge_type),
-                            label: const Text('တစ်ဆက်တည်း ပေါင်းထုတ်မည်'),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: const Color(0xFFAA00FF),
-                              foregroundColor: Colors.white,
-                              padding: const EdgeInsets.symmetric(vertical: 12),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-
-                  if (_statusMessage.isNotEmpty)
-                    Padding(
-                      padding: const EdgeInsets.all(12),
-                      child: Container(
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF263238),
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: Text(
-                          _statusMessage,
-                          style: const TextStyle(color: Color(0xFF80D8FF)),
-                        ),
-                      ),
-                    ),
-                ],
-              ),
+                ),
+              ],
             ),
     );
   }
