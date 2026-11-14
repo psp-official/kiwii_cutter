@@ -1,0 +1,19 @@
+name: Kiwii Cutter
+description: Offline Lossless Video Cutter for Android
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.2.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  video_player: ^2.8.6
+  file_picker: ^8.0.3
+  ffmpeg_kit_flutter_min: ^6.0.3
+  path_provider: ^2.1.3
+  gal: ^2.3.0
+
+flutter:
+  uses-material-design: true
