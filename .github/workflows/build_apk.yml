@@ -21,22 +21,25 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.22.2'
+          flutter-version: '3.27.4'
           channel: 'stable'
 
       - name: Generate Android Shell and Configure Permissions
         run: |
           cp pubspec.yaml /tmp/pubspec.yaml
           cp lib/main.dart /tmp/main.dart
-          flutter create --platforms=android --org com.lossless.cutter .
+          flutter create --project-name lossless_cutter --platforms=android --org com.lossless.cutter .
           cp /tmp/pubspec.yaml pubspec.yaml
           cp /tmp/main.dart lib/main.dart
 
-          # FFmpegKit အတွက် minSdkVersion ကို 24 သို့ မြှင့်တင်ခြင်း
-          sed -i 's/minSdkVersion .*/minSdkVersion 24/g' android/app/build.gradle || true
+          # Stel compileSdk 35 en minSdk 24 in voor gal en FFmpegKit
+          sed -i 's/compileSdk = .*/compileSdk = 35/g' android/app/build.gradle || true
+          sed -i 's/compileSdkVersion .*/compileSdkVersion 35/g' android/app/build.gradle || true
           sed -i 's/minSdk = .*/minSdk = 24/g' android/app/build.gradle || true
+          sed -i 's/minSdkVersion .*/minSdkVersion 24/g' android/app/build.gradle || true
+          sed -i 's/targetSdk = .*/targetSdk = 35/g' android/app/build.gradle || true
 
-          # Android Gallery သိမ်းဆည်းခွင့် Permissions ထည့်သွင်းခြင်း
+          # Voeg Android-opslagrechten toe voor het opslaan in de galerij
           sed -i '/<application/i <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>\n<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" tools:replace="android:maxSdkVersion"/>\n<uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>' android/app/src/main/AndroidManifest.xml
           sed -i 's/<manifest /<manifest xmlns:tools="http:\/\/schemas.android.com\/tools" /g' android/app/src/main/AndroidManifest.xml
 
@@ -50,4 +53,3 @@ jobs:
         with:
           name: Lossless-Cutter-APK
           path: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
-
