@@ -1,4 +1,4 @@
-name: Build Kiwii Cutter APK
+name: Build Lossless Cutter APK
 
 on:
   push:
