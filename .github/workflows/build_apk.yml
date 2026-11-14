@@ -28,15 +28,15 @@ jobs:
         run: |
           cp pubspec.yaml /tmp/pubspec.yaml
           cp lib/main.dart /tmp/main.dart
-          flutter create --project-name lossless_cutter --platforms=android --org com.lossless.cutter .
+          flutter create --platforms=android --org com.lossless.cutter .
           cp /tmp/pubspec.yaml pubspec.yaml
           cp /tmp/main.dart lib/main.dart
 
-          # Verhoog minSdkVersion naar 24 voor FFmpegKit
+          # FFmpegKit အတွက် minSdkVersion ကို 24 သို့ မြှင့်တင်ခြင်း
           sed -i 's/minSdkVersion .*/minSdkVersion 24/g' android/app/build.gradle || true
           sed -i 's/minSdk = .*/minSdk = 24/g' android/app/build.gradle || true
 
-          # Voeg Android-opslagrechten toe voor het opslaan in de galerij
+          # Android Gallery သိမ်းဆည်းခွင့် Permissions ထည့်သွင်းခြင်း
           sed -i '/<application/i <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>\n<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" tools:replace="android:maxSdkVersion"/>\n<uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>' android/app/src/main/AndroidManifest.xml
           sed -i 's/<manifest /<manifest xmlns:tools="http:\/\/schemas.android.com\/tools" /g' android/app/src/main/AndroidManifest.xml
 
